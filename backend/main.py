@@ -146,6 +146,10 @@ def affiliate_url(url):
         parts = urlparse(url)
         query = dict(parse_qsl(parts.query, keep_blank_values=True))
         query["tag"] = tag
+        # Drop the feed source's own tracking label (e.g. Smartprix's
+        # ascsubtag): the `tag` is what decides which Associates account
+        # gets paid; the subtag only lets the source track the click.
+        query.pop("ascsubtag", None)
         return urlunparse(parts._replace(query=urlencode(query)))
     pub_id = os.environ.get("CUELINKS_ID", "").strip()
     if not pub_id:
