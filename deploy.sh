@@ -9,6 +9,8 @@ set -euo pipefail
 PROJECT_ID="${PROJECT_ID:?set PROJECT_ID, e.g. PROJECT_ID=tech-deals-india}"
 REGION="asia-east1"
 SERVICE="tech-deals-agent"
+# The working gcloud login lives in this config dir (default config has no accounts).
+export CLOUDSDK_CONFIG="$HOME/workspace/.gcloud-config"
 GCLOUD="$HOME/workspace/google-cloud-sdk/bin/gcloud"
 [ -x "$GCLOUD" ] || GCLOUD="gcloud"
 
@@ -32,9 +34,19 @@ set -a; # shellcheck disable=SC1091
   --type=firestore-native --project="$PROJECT_ID" 2>/dev/null \
   || echo "Firestore database already exists — continuing."
 
-# Build + deploy (Cloud Build builds the image; no local Docker needed).
+# NOTE (2026-11-22): `gcloud run deploy --source` HANGS in this environment
+# and never starts a build (same as the clinic backend). Build with
+# Cloud Build to Artifact Registry first, then deploy the image.
+"$GCLOUD" artifacts repositories create tech-deals \
+  --repository-format=docker --location="$REGION" \
+  --project="$PROJECT_ID" 2>/dev/null \
+  || echo "Artifact Registry repo already exists — continuing."
+IMAGE="asia-east1-docker.pkg.dev/$PROJECT_ID/tech-deals/tech-deals-agent:latest"
+"$GCLOUD" builds submit --tag "$IMAGE" ./backend --project="$PROJECT_ID"
+
+# Deploy the built image (no --source: it hangs here).
 "$GCLOUD" run deploy "$SERVICE" \
-  --source ./backend \
+  --image "$IMAGE" \
   --region "$REGION" \
   --memory 256Mi --cpu 1 --max-instances 1 --min-instances 0 \
   --allow-unauthenticated \

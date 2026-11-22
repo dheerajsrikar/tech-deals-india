@@ -54,7 +54,7 @@
 <script>
   // Replaced at deploy time with the real Cloud Run URL (see deploy.sh).
   // You can also override it with ?api=https://your-service.a.run.app/deals
-  var API_URL = "__API_URL__";
+  var API_URL = "https://tech-deals-agent-bd6lholurq-de.a.run.app/deals";
   var params = new URLSearchParams(location.search);
   if (params.get("api")) API_URL = params.get("api");
 
