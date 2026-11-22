@@ -3,5 +3,6 @@ flask-cors
 gunicorn
 feedparser
 requests
+beautifulsoup4
 google-genai
 google-cloud-firestore
