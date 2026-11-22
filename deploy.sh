@@ -51,6 +51,7 @@ IMAGE="asia-east1-docker.pkg.dev/$PROJECT_ID/tech-deals/tech-deals-agent:latest"
   --memory 256Mi --cpu 1 --max-instances 1 --min-instances 0 \
   --allow-unauthenticated \
   --set-env-vars "CRON_SECRET=$CRON_SECRET,GEMINI_API_KEY=$GEMINI_API_KEY,TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN,TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID,AMAZON_TAG=${AMAZON_TAG:-},CUELINKS_ID=${CUELINKS_ID:-},PINTEREST_TOKEN=${PINTEREST_TOKEN:-},PINTEREST_BOARD_ID=${PINTEREST_BOARD_ID:-}" \
+  --set-env-vars "^;^RSS_FEED_URLS=${RSS_FEED_URLS:-}" \
   --project="$PROJECT_ID"
 
 URL=$("$GCLOUD" run services describe "$SERVICE" --region "$REGION" \

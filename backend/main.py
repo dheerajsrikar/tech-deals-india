@@ -4,22 +4,28 @@ Runs on Google Cloud Run (Always Free Tier) + Firestore (Native Mode).
 Every 2 hours Cloud Scheduler calls GET /run?key=CRON_SECRET.
 
 Flow per run:
-  1. Fetch the DesiDime deals RSS (latest 8 items).
-  2. Skip any URL whose MD5 is already in Firestore `posted_deals`
-     (deduplication — a deal is never processed twice).
-  3. Ask Gemini (gemini-3.5-flash-lite, free tier) to approve ONLY
+  1. Fetch each RSS feed in RSS_FEED_URLS (latest 8 items per feed,
+     max 10 items processed per run).
+  2. For each item, extract the real merchant link (Amazon/Flipkart/...)
+     — from the entry itself, or by fetching the deal blog post and
+     taking its first merchant link; falls back to the item link.
+  3. Skip any merchant URL whose MD5 is already in Firestore
+     `posted_deals` (deduplication — a deal is never processed twice).
+  4. Ask Gemini (gemini-3.5-flash-lite, free tier) to approve ONLY
      Smartphones, Laptops, Earbuds, Headphones, Smartwatches, Tablets,
      Power Banks, Chargers or Branded Tech Accessories — and to write the
      headline / Telegram alert / Pinterest copy / price tag as strict JSON.
-  4. Wrap the store link with the Amazon Associates tag (amazon.in) or
+  5. Wrap the store link with the Amazon Associates tag (amazon.in) or
      Cuelinks (every other store).
-  5. Post to Telegram (inline "Grab Deal Now" button) and, when configured,
+  6. Post to Telegram (inline "Grab Deal Now" button) and, when configured,
      pin to Pinterest. Save the deal to Firestore `deals` for the website.
 
 Env vars (set on Cloud Run, never committed to git):
   CRON_SECRET, GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
   AMAZON_TAG, CUELINKS_ID, PINTEREST_TOKEN, PINTEREST_BOARD_ID
-Optional: FIRESTORE_PROJECT (defaults to the GCP project), RSS_URL.
+Optional: FIRESTORE_PROJECT (defaults to the GCP project),
+  RSS_FEED_URLS (comma-separated; default: the three open Indian deal
+  feeds below), RSS_URL (legacy single-feed override).
 """
 
 import hashlib
@@ -29,6 +35,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
 
 import feedparser
@@ -42,10 +49,44 @@ log = logging.getLogger("tech-deals-agent")
 app = Flask(__name__)
 CORS(app)  # /deals is a public endpoint consumed by GitHub Pages
 
-RSS_URL = os.environ.get(
-    "RSS_URL", "https://www.desidime.com/deals.rss")
+# DesiDime (the original single source) returns 403 to Cloud Run egress
+# and to this VM — its WAF blocks cloud IPs outright (verified 2026-11-22).
+# These open Indian deal feeds are the replacements; the Cloud Run live
+# test (see DEPLOY-NOTES.md) settles which of them answer 200 from Google.
+_DEFAULT_FEEDS = (
+    "https://www.indiafreestuff.in/feed,"
+    "https://www.smartprix.com/feed/,"
+    "https://www.gyftr.com/blog/feed/,"
+    "https://www.couponrani.com/feed,"
+    "https://www.mysmartprice.com/feed"
+)
+_RSS_URLS_RAW = os.environ.get("RSS_FEED_URLS", "").strip()
+if not _RSS_URLS_RAW:
+    _RSS_URLS_RAW = os.environ.get("RSS_URL", "").strip() or _DEFAULT_FEEDS
+RSS_FEED_URLS = [u.strip() for u in _RSS_URLS_RAW.split(",") if u.strip()]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
-MAX_ITEMS_PER_RUN = int(os.environ.get("MAX_ITEMS_PER_RUN", "8"))
+# Total items processed per run across all feeds (keeps a run well inside
+# the Scheduler's 180s attempt deadline: ~10 x (page fetch + Gemini)).
+MAX_ITEMS_PER_RUN = int(os.environ.get("MAX_ITEMS_PER_RUN", "10"))
+MAX_ITEMS_PER_FEED = int(os.environ.get("MAX_ITEMS_PER_FEED", "8"))
+
+# Merchant domains a deal link may point at. Blog posts link to these;
+# anything else in an entry is treated as a blog/internal link.
+MERCHANT_HOSTS = (
+    "amazon.in", "amazon.com", "flipkart.com", "croma.com",
+    "reliancedigital.in", "vijaysales.com", "tatacliq.com",
+    "myntra.com", "ajio.com", "mi.com", "samsung.com", "oneplus.in",
+    "realme.com", "oppo.com", "vivo.com", "store.google.com",
+    "apple.com", "snapdeal.com", "boat-lifestyle.com",
+)
+SHORTENER_HOSTS = (
+    "amzn.to", "fkrt.it", "bit.ly", "tinyurl.com", "goo.gl",
+    "cutt.ly", "shorturl.at", "t.co",
+    # Deal-site redirectors: the href is not the merchant itself, but
+    # following it lands on the merchant (e.g. Smartprix "Buy" buttons
+    # go through l.smartprix.com -> amazon.in / flipkart.com).
+    "l.smartprix.com",
+)
 
 ALLOWED_CATEGORIES = (
     "Smartphones, Laptops, Earbuds, Headphones, Smartwatches, Tablets, "
@@ -227,15 +268,106 @@ def post_pinterest(aff_url, review, image):
         return False
 
 
+# ------------------------------------------------------- Merchant links
+def _host(url):
+    try:
+        return urlparse(url).netloc.lower().lstrip("www.")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _is_merchant(url):
+    h = _host(url)
+    return any(h == m or h.endswith("." + m) for m in MERCHANT_HOSTS)
+
+
+def _resolve_shortener(url):
+    """Follow a short link (amzn.to / fkrt.it / bit.ly ...) to its final
+    URL; returns the original URL when resolution fails or is not a
+    shortener."""
+    if _host(url) not in SHORTENER_HOSTS:
+        return url
+    try:
+        r = requests.get(url, headers=RSS_HEADERS, timeout=8,
+                         allow_redirects=True)
+        if r.url and r.url != url:
+            return r.url
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Short-link resolve failed (%s): %s", url, exc)
+    return url
+
+
+def _merchant_from_html(html):
+    """First merchant href in an HTML page, in document order. A
+    shortener/redirector href is followed and counts if it lands on a
+    merchant."""
+    seen = set()
+    for href in re.findall(r'href=["\']([^"\']+)["\']', html or "", re.I):
+        href = href.strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:")):
+            continue
+        if not href.startswith("http"):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        if _is_merchant(href):
+            return _resolve_shortener(href)
+        if _host(href) in SHORTENER_HOSTS:
+            resolved = _resolve_shortener(href)
+            if _is_merchant(resolved):
+                return resolved
+    return ""
+
+
+def extract_merchant_link(entry):
+    """Real store link for an RSS item.
+
+    1. Any merchant URL already in the entry (link, feedparser links,
+       or hrefs inside the summary/description) wins — no extra fetch.
+    2. Otherwise fetch the item page (a deal blog post) and take its
+       first merchant link.
+    3. Fall back to the item link itself.
+    """
+    blog_link = (entry.get("link") or "").strip()
+    candidates = []
+    if blog_link:
+        candidates.append(blog_link)
+    html = (entry.get("html") or entry.get("summary")
+            or entry.get("description") or "")
+    for lnk in entry.get("links") or []:
+        href = (lnk.get("href") or "").strip()
+        if href:
+            candidates.append(href)
+    candidates += re.findall(r'href=["\']([^"\']+)["\']', html or "", re.I)
+    for url in candidates:
+        url = url.strip()
+        if _is_merchant(url):
+            return _resolve_shortener(url)
+        if _host(url) in SHORTENER_HOSTS:
+            resolved = _resolve_shortener(url)
+            if _is_merchant(resolved):
+                return resolved
+    if blog_link and not _is_merchant(blog_link):
+        try:
+            r = requests.get(blog_link, headers=RSS_HEADERS, timeout=8)
+            r.raise_for_status()
+            merchant = _merchant_from_html(r.text)
+            if merchant:
+                return merchant
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Blog-page fetch failed (%s): %s", blog_link, exc)
+    return blog_link
+
+
 # ---------------------------------------------------------------------- Feed
-def fetch_feed():
-    """Fetch + parse the RSS feed. Retries 3x: DesiDime's WAF kills some
-    connections mid-transfer, so a single failed attempt proves nothing.
-    Returns [] only after all attempts fail (a run then reports
-    checked=0 instead of crashing)."""
+def fetch_feed(feed_url):
+    """Fetch + parse one RSS feed. Retries 3x with backoff; returns []
+    only after all attempts fail (a run then reports that feed as
+    failed instead of crashing)."""
     for attempt in range(1, 4):
         try:
-            r = requests.get(RSS_URL, headers=RSS_HEADERS, timeout=25)
+            r = requests.get(feed_url, headers=RSS_HEADERS, timeout=15)
             r.raise_for_status()
             content = r.content  # read inside try: truncated chunked
             # responses raise ChunkedEncodingError here, not on .get()
@@ -244,12 +376,12 @@ def fetch_feed():
                     len(content)))
         except Exception as exc:  # noqa: BLE001
             log.warning("RSS fetch attempt %d/3 failed (%s): %s",
-                        attempt, RSS_URL, exc)
+                        attempt, feed_url, exc)
             time.sleep(2 * attempt)
             continue
         feed = feedparser.parse(content)
         items = []
-        for e in feed.entries[:MAX_ITEMS_PER_RUN]:
+        for e in feed.entries[:MAX_ITEMS_PER_FEED]:
             link = (e.get("link") or "").strip()
             if not link:
                 continue
@@ -257,14 +389,23 @@ def fetch_feed():
             summary = re.sub(r"<[^>]+>", " ",
                              (e.get("summary") or e.get("description") or ""))
             summary = re.sub(r"\s+", " ", summary).strip()
+            # Full post HTML (WordPress content:encoded) often carries the
+            # merchant "Buy" links that the short summary does not.
+            html = (e.get("summary") or e.get("description") or "")
+            content = e.get("content") or []
+            if content:
+                html += " " + (content[0].get("value") or "")
             image = ""
             if e.get("media_content"):
                 image = e.media_content[0].get("url", "")
             elif e.get("enclosures"):
                 image = e.enclosures[0].get("href", "")
             items.append({"title": title, "summary": summary,
-                          "link": link, "image": image})
+                          "link": link, "image": image,
+                          "html": html, "source_feed": feed_url})
+        log.info("Feed OK (%s): %d entries", feed_url, len(items))
         return items
+    log.warning("Feed FAILED after 3 attempts: %s", feed_url)
     return []
 
 
@@ -272,7 +413,7 @@ def fetch_feed():
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"service": "tech-deals-agent", "status": "ok",
-                    "model": MODEL, "rss": RSS_URL})
+                    "model": MODEL, "feeds": RSS_FEED_URLS})
 
 
 @app.route("/run", methods=["GET"])
@@ -288,21 +429,38 @@ def run():
     if db is None:
         return jsonify({"error": "firestore_unavailable"}), 500
 
-    items = fetch_feed()
+    items = []
+    feed_stats = {}
+    # Fetch feeds concurrently: a dead feed costs ~45s of retries, and
+    # serial fetching would push the run past the Scheduler's 180s
+    # deadline. Concurrently the run costs only the slowest feed.
+    with ThreadPoolExecutor(max_workers=len(RSS_FEED_URLS)) as pool:
+        fetched = list(pool.map(fetch_feed, RSS_FEED_URLS))
+    for feed_url, feed_items in zip(RSS_FEED_URLS, fetched):
+        feed_stats[feed_url] = {"status": "ok" if feed_items else "failed",
+                                "entries": len(feed_items)}
+        items.extend(feed_items)
+    items = items[:MAX_ITEMS_PER_RUN]
     checked = len(items)
     posted = approved = skipped = 0
     for item in items:
-        digest = url_hash(item["link"])
+        # Resolve the real merchant link first, then dedup on THAT url —
+        # the same product posted by two blogs is one deal.
+        merchant_url = extract_merchant_link(item)
+        if not merchant_url:
+            skipped += 1
+            continue
+        digest = url_hash(merchant_url)
         ref = db.collection("posted_deals").document(digest)
         if ref.get().exists:
             skipped += 1
             continue
         review = ai_review(item["title"], item["summary"],
-                           item["link"], item["image"])
+                           merchant_url, item["image"])
         status = "rejected"
         if review and review.get("approved"):
             approved += 1
-            aff = affiliate_url(item["link"])
+            aff = affiliate_url(merchant_url)
             tg_ok = post_telegram(aff, review)
             pin_ok = post_pinterest(aff, review, item["image"])
             now = time.time()
@@ -311,7 +469,9 @@ def run():
                 "price_tag": review.get("price_tag", "Deal Price"),
                 "telegram_html": review.get("telegram_html", ""),
                 "pin_description": review.get("pin_description", ""),
-                "original_url": item["link"],
+                "original_url": merchant_url,
+                "source_url": item["link"],
+                "source_feed": item.get("source_feed", ""),
                 "affiliate_url": aff,
                 "image": item["image"],
                 "source_title": item["title"],
@@ -322,10 +482,13 @@ def run():
             if tg_ok:
                 posted += 1
             status = "posted" if tg_ok else "approved_not_posted"
-        ref.set({"url": item["link"], "title": item["title"],
+        ref.set({"url": merchant_url, "source_url": item["link"],
+                 "source_feed": item.get("source_feed", ""),
+                 "title": item["title"],
                  "status": status, "ts": time.time()})
     return jsonify({"checked": checked, "approved": approved,
-                    "posted": posted, "skipped": skipped})
+                    "posted": posted, "skipped": skipped,
+                    "feeds": feed_stats})
 
 
 @app.route("/deals", methods=["GET"])
