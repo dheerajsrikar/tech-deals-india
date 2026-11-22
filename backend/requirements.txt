@@ -1,0 +1,7 @@
+flask
+flask-cors
+gunicorn
+feedparser
+requests
+google-genai
+google-cloud-firestore
